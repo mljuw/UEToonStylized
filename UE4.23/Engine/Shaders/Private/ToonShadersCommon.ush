@@ -1,0 +1,168 @@
+// Aniso tangent input (UV space) are always length agnostic, so we can gain an additional GBuffer float channel by encoding it to 1D. Only works for materials where the Tangent is also plugged into the slot that writes to the World Normal buffer. (Hair)
+float EncodeUnitVectorToFloat(float2 N)
+{
+	N = normalize(N);
+	float result = ( N.y > 0 ) ? ( N.x + 1.1 ) : N.x;
+	return result / 1.1;
+}
+
+float2 DecodeUnitVectorFromFloat(float x)
+{
+	float2 N = (0,0);
+	N.x = x * 1.1;
+	if (x > 1)
+	{
+		N.x = N.x - 1.1;
+		N.y = -1 * ( sqrt( 1 - pow(N.x,2) ) );
+	}
+	else
+	{
+		N.y = sqrt( 1 - pow(N.x,2) );
+	}
+	return normalize(N);
+}
+
+// RGB -> HSV Conversions
+float3 HUEtoRGB(float H)
+{
+	float R = abs(H * 6 - 3) - 1;
+	float G = 2 - abs(H * 6 - 2);
+	float B = 2 - abs(H * 6 - 4);
+	return saturate(float3(R,G,B));
+}
+
+float3 RGBtoHCV(float3 RGB)
+{
+	float Epsilon = 1e-10;
+	// Based on work by Sam Hocevar and Emil Persson
+	float4 P = (RGB.g < RGB.b) ? float4(RGB.bg, -1.0, 2.0/3.0) : float4(RGB.gb, 0.0, -1.0/3.0);
+	float4 Q = (RGB.r < P.x) ? float4(P.xyw, RGB.r) : float4(RGB.r, P.yzx);
+	float C = Q.x - min(Q.w, Q.y);
+	float H = abs((Q.w - Q.y) / (6 * C + Epsilon) + Q.z);
+	return float3(H, C, Q.x);
+}
+
+float3 RGBtoHSV(float3 RGB)
+{
+	float Epsilon = 1e-10;
+
+	float3 HCV = RGBtoHCV(RGB);
+	float S = HCV.y / (HCV.z + Epsilon);
+	return float3(HCV.x, S, HCV.z);
+}
+
+float3 HSVtoRGB(float3 HSV)
+{
+	float3 RGB = HUEtoRGB(HSV.x);
+	return ((RGB - 1) * HSV.y + 1) * HSV.z;
+}
+
+// EncodeColor2D() trades hue and value precision for an additional Saturation output upon decoding
+float EncodeSOffset (float S, float SatD, float ValRD)
+{
+	float RawOffset =  fmod( S, ( 1 / SatD ) ); // this is the raw offset from the next lowest saturation step acquired from SatD.
+	float A = 1 / ( SatD * ValRD );
+	float B = 1 / ValRD;
+	return floor( ( RawOffset / A ) * B );
+}
+
+float DecodeV (float HVy, float ValRD)
+{
+	float SOffset = floor(HVy * ValRD) * (1 / ValRD); // decode the sat offset (represents an index)
+	return ( HVy - SOffset ) * ValRD;
+}
+
+float DecodeSAdd (float HVy, float SatD, float ValRD)
+{
+	float SOffset = floor(HVy * ValRD) / ValRD; // decode the sat offset (represents an index)
+	return SOffset / SatD;
+}
+
+float2 EncodeColor2D (float3 RGB) // expects an RGB color
+{
+	// hue precision divider
+	float SatD = 8;
+
+	// value precision devider
+	float ValRD = 10;
+
+	// 0 or 1 gives us errors. 0.0025 is smallest number determined not to give precision errors in subsequent operations through testing
+	float A = 0.0025;
+	float B = 0.9900;
+	RGB = clamp( (RGB), (A,A,A), (B,B,B)); // represented as HSV, we can decide what dimension is most important
+	float3 HSV = RGBtoHSV(RGB);
+
+	float S = floor( SatD * HSV.y ) / SatD;
+	
+	float H = ( HSV.x / SatD ) + S;
+
+	float SOffset = EncodeSOffset(HSV.y, SatD, ValRD);
+
+	float V = HSV.z / ValRD + SOffset;
+
+	return float2(H,V);
+}
+
+float3 DecodeColor2D (float2 HV) // returns an RGB color
+{ 
+	// hue precision divider
+	float SatM = 8;
+	float SatD = 1/SatM;
+
+	// value precision divider
+	float ValRD = 10;
+
+	float OutH = fmod( HV.x, SatD ) * SatM;
+
+	float OutV = DecodeV(HV.y, ValRD);
+
+	float SAdd = DecodeSAdd(HV.y, SatD, ValRD);
+
+	float OutS = ( floor( ( HV.x / SatD) ) / SatM ) + SAdd;
+	
+	float3 HSV = float3(OutH, OutS, OutV);
+	return HSVtoRGB(HSV);
+}
+
+// encodes 8 steps of specular softness into the desired buffer. used for toon skin
+float EncodeSpecRange (float Xi, float Yi)
+{
+	const float Div = 8;
+	Xi = saturate(Xi) * 0.97 + 0.015;
+	Yi = saturate(Yi) * 0.8;
+
+	float Offset = floor(Yi * Div) / Div;
+	float Range = Xi / Div;
+	float Result = Offset + Range;
+	return Result;
+}
+
+float2 DecodeSpecRange (float InputVal)
+{
+	// for some reason, putting the divisor into a variable breaks the encoding. Might be some weird hlsl thing
+	const float HY = fmod( floor(InputVal * 8), 8 ) * 0.125;
+	float HX = ( InputVal - HY ) * 8;
+	HX = HX * (1/0.98) - 0.01;
+	return float2(HX, HY);
+}
+
+// Used for switching between soft and hard sss modes for toon skin
+float EncodeSSSModeSwitch (float Xi, float Yi)
+{
+	const float Div = 2;
+	const float Div2 = 2.1;
+	Yi = clamp( Yi, 0, 0.99);
+	float Offset = floor(Yi * Div) / Div;
+	float Range = Xi / Div2;
+	float Result = Offset + Range;
+	return Result / 1.5;
+}
+
+float2 DecodeSSSModeSwitch (float InputVal)
+{
+	// for some reason, putting the divisor into a variable breaks the encoding. Might be some weird hlsl thing
+	InputVal = InputVal * 1.5;
+	const float HY = fmod( floor(InputVal * 2), 2 ) * 0.5;
+	float HX = ( InputVal - HY  ) * 2.1;
+	return float2(HX, HY );
+}
